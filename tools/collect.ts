@@ -3,15 +3,16 @@
 //   node tools/collect.ts                 fetch the page once, save the raw HTML, parse it, append one read
 //   node tools/collect.ts --html <file>   parse a saved page instead (no network), append nothing unless --append
 //
-// Output (outside the repository): $FORECAST_DATA or /Users/tinhdo/Downloads/makefun/forecast-data
+// Output (outside the repository): $FORECAST_DATA, else the forecast-data folder beside the repository
 //   reads.jsonl     one JSON line per read: {slot, at, players_tracked, trophies_earned, rates}
 //   trophies.json   the trophy list in Exophase order: [{id, name, description, tier, points, secret}]
 //   raw/<stamp>.html the page as fetched
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const URL_ = 'https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/';
-const DATA_DIR = process.env.FORECAST_DATA ?? '/Users/tinhdo/Downloads/makefun/forecast-data';
+const DATA_DIR = process.env.FORECAST_DATA ?? fileURLToPath(new URL('../../forecast-data', import.meta.url));
 const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',

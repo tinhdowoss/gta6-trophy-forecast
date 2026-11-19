@@ -9,10 +9,12 @@
 // house's first recorder read every 30).
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const args = process.argv.slice(2);
 const arg = (name: string, dflt?: string): string | undefined => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : dflt; };
-const dataDir = arg('--data', '/Users/tinhdo/Downloads/makefun/forecast-data')!;
+const DEFAULT_DATA = process.env.FORECAST_DATA ?? fileURLToPath(new URL('../../forecast-data', import.meta.url));
+const dataDir = arg('--data', DEFAULT_DATA)!;
 const cut = arg('--cut');
 if (!cut) throw new Error('--cut is required');
 const cutMs = Date.parse(cut);
@@ -21,7 +23,7 @@ const horizon = targetArg ? Math.round((Date.parse(targetArg) - cutMs) / 60_000)
 const targetMs = cutMs + horizon * 60_000;
 const iso = (ms: number): string => new Date(ms).toISOString().replace('.000Z', 'Z');
 const id = arg('--id', 'x00')!;
-const out = arg('--out', '/Users/tinhdo/Downloads/makefun/forecast-data/cases')!;
+const out = arg('--out', join(DEFAULT_DATA, 'cases'))!;
 const every = Number(arg('--recorder-minutes', '10'));
 
 interface Read { slot: string; at: string; players_tracked: number; trophies_earned: number | null; rates: Array<number | null> }

@@ -15,8 +15,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const DATA = process.env.FORECAST_DATA ?? '/Users/tinhdo/Downloads/makefun/forecast-data';
-const KIT_INPUT = '/Users/tinhdo/Downloads/makefun/kit-forecast/gta6-trophy-rarity-forecast-01-kit/input';
+const DATA = process.env.FORECAST_DATA ?? join(ROOT, '..', 'forecast-data');
+const KIT_INPUT = process.env.KIT_INPUT ?? join(ROOT, '..', 'kit-forecast', 'gta6-trophy-rarity-forecast-01-kit', 'input');
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 

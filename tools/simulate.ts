@@ -3,7 +3,7 @@
 //   node tools/simulate.ts --trophies <case.in or trophies.json> --seed 1 [--out <dir>]
 //
 // Writes <out>/reads.jsonl (one read every 10 minutes in the case-history shape) and <out>/trophies.json, by default to
-// /Users/tinhdo/Downloads/makefun/forecast-data/synthetic/s<seed>/. These are the simulator's assumptions, not data:
+// forecast-data/synthetic/s<seed>/ beside the repository. These are the simulator's assumptions, not data:
 //   - players buy the game over the week (most on day one) and play a lognormal number of hours a day;
 //   - Exophase starts tracking a player some lognormal delay after they start, so the tracked base keeps adding
 //     players who have played little (dilution);
@@ -12,6 +12,7 @@
 //   - Exophase refreshes on a cadence drawn per seed (1 to 12 hours, jittered); the page prints rates to 2 decimals.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 interface Trophy { id: number; name: string; description: string; tier: string; points: number; secret: boolean }
 
@@ -34,10 +35,11 @@ const normal = (): number => { const u = Math.max(1e-12, rnd()), v = rnd(); retu
 const lognormal = (median: number, sd: number): number => median * Math.exp(sd * normal());
 const uniform = (a: number, b: number): number => a + (b - a) * rnd();
 
-const src = JSON.parse(readFileSync(arg('--trophies', '/Users/tinhdo/Downloads/makefun/kit-forecast/gta6-trophy-rarity-forecast-01-kit/input/p00.in'), 'utf8'));
+const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url));
+const src = JSON.parse(readFileSync(arg('--trophies', here('../../kit-forecast/gta6-trophy-rarity-forecast-01-kit/input/p00.in')), 'utf8'));
 const trophies: Trophy[] = Array.isArray(src) ? src : src.trophies;
 const prelaunch: Array<number | null> | null = Array.isArray(src) ? null : src.history?.[0]?.rates ?? null;
-const outDir = arg('--out', `/Users/tinhdo/Downloads/makefun/forecast-data/synthetic/s${seed}`);
+const outDir = arg('--out', join(process.env.FORECAST_DATA ?? here('../../forecast-data'), 'synthetic', `s${seed}`));
 
 // ---- trophy archetypes: (play hours needed, chance a player ever goes for it) ----
 interface Need { hours: number; prob: number; spread: number }
@@ -60,11 +62,15 @@ const needs: Need[] = trophies.map((t) => {
 const platIdx = trophies.findIndex((t) => t.tier === 'platinum');
 
 // ---- players ----
+// --pace scales how fast players play (below 1: a calmer week whose rates move less); --late scales how late players
+// buy and get tracked (above 1: more dilution by newcomers through the week).
+const pace = Number(arg('--pace', '1'));
+const late = Number(arg('--late', '1'));
 const N = Math.round(uniform(40_000, 120_000));
-const buyMeanH = uniform(10, 30);
-const trackDelayMedH = uniform(12, 48);
+const buyMeanH = uniform(10, 30) * late;
+const trackDelayMedH = uniform(12, 48) * late;
 const interestMedH = uniform(15, 35); // total hours a player will put in this week, median
-const hoursPerDayMed = uniform(2, 4);
+const hoursPerDayMed = uniform(2, 4) * pace;
 const nT = trophies.length;
 // visible[i] = sorted clock hours at which each player's trophy i became visible to Exophase
 const visible: number[][] = trophies.map(() => []);
