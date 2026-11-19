@@ -1,131 +1,138 @@
-// One polite read of Exophase's GTA VI (PS5) trophy page, appended to the local recording in the case-history shape.
+// One polite read of Exophase's GTA VI (PS5) trophy page, stored the way a case's history stores a read.
 //
-//   node tools/collect.ts                 fetch the page once, save the raw HTML, parse it, append one read
-//   node tools/collect.ts --html <file>   parse a saved page instead (no network), append nothing unless --append
+//   node tools/collect.ts [--data <dir>] [--url <page>]
 //
-// Output (outside the repository): $FORECAST_DATA, else the forecast-data folder beside the repository
-//   reads.jsonl     one JSON line per read: {slot, at, players_tracked, trophies_earned, rates}
-//   trophies.json   the trophy list in Exophase order: [{id, name, description, tier, points, secret}]
-//   raw/<stamp>.html the page as fetched
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Appends one line {slot, at, players_tracked, trophies_earned, rates} to <data>/reads.jsonl and writes the trophy list
+// ({id, name, description, tier, points, secret}, in page order) to <data>/trophies.json. The page as fetched is kept
+// under <data>/raw/ so a parse can be checked. Exactly one request per run, no retries: schedule it (for example every
+// 30 minutes) rather than looping. Data lives outside the repository (default: ../forecast-data beside it).
+
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const URL_ = 'https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/';
-const DATA_DIR = process.env.FORECAST_DATA ?? fileURLToPath(new URL('../../forecast-data', import.meta.url));
-const USER_AGENTS = [
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-];
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const PAGE = 'https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/';
 const POINTS: Record<string, number> = { platinum: 300, gold: 90, silver: 30, bronze: 15 };
 
-interface Trophy { id: number; name: string; description: string; tier: string; points: number; secret: boolean }
-interface Parsed { players_tracked: number; trophies_earned: number | null; trophies: Trophy[]; rates: number[]; total: number | null }
+function argValue(name: string, fallback: string): string {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+}
 
-function decodeEntities(s: string): string {
-  return s
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&quot;/g, '"').replace(/&apos;|&#039;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ').replace(/&hellip;/g, '…').replace(/&rsquo;/g, '’').replace(/&lsquo;/g, '‘')
+const decodeEntities = (s: string): string =>
+  s
+    .replace(/&#(\d+);/g, (_, d: string) => String.fromCodePoint(Number(d)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;|&#039;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&');
-}
-const text = (html: string): string => decodeEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
-const num = (s: string): number => Number(s.replace(/[,\s]/g, ''));
+const stripTags = (s: string): string => decodeEntities(s.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+const toInt = (s: string): number => Number(s.replace(/[^\d]/g, ''));
 
-/** Pull a labelled count out of the page text, e.g. "12,345 Players" or "Players Tracked 12,345". */
-function findCount(plain: string, labels: string[]): number | null {
-  for (const label of labels) {
-    const after = new RegExp(`${label}\\s*:?\\s*([\\d,]+)`, 'i').exec(plain);
-    if (after) return num(after[1]);
-    const before = new RegExp(`([\\d,]+)\\s*${label}`, 'i').exec(plain);
-    if (before) return num(before[1]);
-  }
-  return null;
+interface ParsedTrophy {
+  name: string;
+  description: string;
+  tier: string;
+  secret: boolean;
+  rate: number;
 }
 
-/** Parse the trophy list: each trophy is an <li> carrying its tier class, a title, a description and a rarity "x.xx%". */
-export function parsePage(html: string): Parsed {
-  const plain = text(html);
-  const players = findCount(plain, ['Players Tracked', 'Players', 'Gamers Tracked', 'Owners']);
-  if (players === null) throw new Error('players tracked not found');
-  const earned = findCount(plain, ['Trophies Earned', 'Achievements Earned', 'Earned']);
-  const total = findCount(plain, ['Total Trophies', 'Trophies']);
-
-  const trophies: Trophy[] = [];
-  const rates: number[] = [];
-  // Every list item that carries an award id is one trophy.
-  const itemRe = /<li\b[^>]*\bdata-award-id="?\d+"?[^>]*>([\s\S]*?)(?=<li\b[^>]*\bdata-award-id=|<\/ul>)/g;
-  for (let m = itemRe.exec(html); m; m = itemRe.exec(html)) {
-    const open = m[0].slice(0, m[0].indexOf('>') + 1);
-    const body = m[1];
-    const tierMatch = /(platinum|gold|silver|bronze)/i.exec(open) ?? /award-(platinum|gold|silver|bronze)|trophy-(platinum|gold|silver|bronze)|\b(platinum|gold|silver|bronze)\b/i.exec(body);
-    const tier = (tierMatch ? (tierMatch[1] ?? tierMatch[2] ?? tierMatch[3] ?? tierMatch[4]) : 'bronze').toLowerCase();
-    const title = /<a[^>]*>([\s\S]*?)<\/a>/.exec(/<h3[\s\S]*?<\/h3>|<div class="award-title"[\s\S]*?<\/div>/.exec(body)?.[0] ?? body);
-    const desc = /<div class="award-description"[^>]*>([\s\S]*?)<\/div>/.exec(body);
-    const rate = /([\d.]+)%/.exec(text(/class="[^"]*(?:rarity|percent|award-earned)[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div)>/.exec(body)?.[0] ?? body));
+/** Pulls every trophy (name, description, tier, rate) and the header counts out of the page. */
+function parsePage(html: string): { trophies: ParsedTrophy[]; players: number; earned: number | null; total: number | null } {
+  const trophies: ParsedTrophy[] = [];
+  // Each trophy is a list item carrying an award title, an award description and its rarity "x.xx%".
+  for (const m of html.matchAll(/<li\b([^>]*)>([\s\S]*?)<\/li>/gi)) {
+    const attrs = m[1];
+    const body = m[2];
+    if (!/award/i.test(attrs + body)) continue;
+    const title = /class="[^"]*award-title[^"]*"[^>]*>([\s\S]*?)<\/(?:div|a|h\d|span)>/i.exec(body);
+    const desc = /class="[^"]*award-description[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(body);
+    const rate = /(\d{1,3}(?:\.\d+)?)\s*%/.exec(stripTags(body.replace(/award-description[\s\S]*?<\/div>/i, '')));
     if (!title || !rate) continue;
+    const tierMatch = /(platinum|gold|silver|bronze)/i.exec(attrs + body);
     trophies.push({
-      id: trophies.length + 1,
-      name: text(title[1]),
-      description: desc ? text(desc[1]) : '',
-      tier,
-      points: POINTS[tier] ?? 15,
-      secret: /\bsecret\b|hidden/i.test(open),
+      name: stripTags(title[1]),
+      description: desc ? stripTags(desc[1]) : '',
+      tier: tierMatch ? tierMatch[1].toLowerCase() : 'bronze',
+      secret: /secret|hidden/i.test(attrs),
+      rate: Number(rate[1]),
     });
-    rates.push(Number(rate[1]));
   }
-  if (trophies.length === 0) throw new Error('no trophies parsed');
-  return { players_tracked: players, trophies_earned: earned, trophies, rates, total };
+  const text = stripTags(html);
+  const players = /([\d,]+)\s*players?\s*tracked/i.exec(text) ?? /players?\s*tracked\D{0,40}([\d,]+)/i.exec(text);
+  const earned = /([\d,]+)\s*trophies\s*earned/i.exec(text) ?? /trophies\s*earned\D{0,40}([\d,]+)/i.exec(text);
+  const total = /total\s*trophies\D{0,40}(\d+)/i.exec(text);
+  return {
+    trophies,
+    players: players ? toInt(players[1]) : NaN,
+    earned: earned ? toInt(earned[1]) : null,
+    total: total ? Number(total[1]) : null,
+  };
 }
 
-async function fetchOnce(ua: string): Promise<{ status: number; html: string }> {
-  const res = await fetch(URL_, {
-    headers: { 'User-Agent': ua, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' },
-    signal: AbortSignal.timeout(20_000),
-    redirect: 'follow',
-  });
-  return { status: res.status, html: await res.text() };
-}
-
-function slotOf(d: Date): string {
-  const s = new Date(Math.floor(d.getTime() / 600_000) * 600_000);
-  return s.toISOString().replace('.000Z', 'Z');
+/** The house's clock slot a read falls in: the start of its 10-minute slot. */
+function slotOf(ms: number): string {
+  return new Date(Math.floor(ms / 600_000) * 600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const htmlArg = args.indexOf('--html');
-  mkdirSync(join(DATA_DIR, 'raw'), { recursive: true });
-  let html: string;
-  let at = new Date();
-  let append = true;
-  if (htmlArg >= 0) {
-    html = readFileSync(args[htmlArg + 1], 'utf8');
-    append = args.includes('--append');
-    const stamp = /(\d{8}T\d{6}Z)/.exec(args[htmlArg + 1]);
-    if (stamp) at = new Date(stamp[1].replace(/(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)Z/, '$1-$2-$3T$4:$5:$6Z'));
-  } else {
-    let r = await fetchOnce(USER_AGENTS[0]);
-    if (r.status === 403 || r.status === 429 || r.status === 503) {
-      console.error(`status ${r.status} with the first User-Agent; one retry with another`);
-      r = await fetchOnce(USER_AGENTS[1]);
+  const data = resolve(argValue('data', process.env.FORECAST_DATA ?? join(REPO, '..', 'forecast-data')));
+  const url = argValue('url', PAGE);
+  mkdirSync(join(data, 'raw'), { recursive: true });
+  const started = Date.now();
+  const stamp = new Date(started).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const res = await fetch(url, {
+    headers: {
+      'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36',
+      accept: 'text/html,application/xhtml+xml',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const html = await res.text();
+  writeFileSync(join(data, 'raw', `${stamp}.html`), html);
+  const log = (line: string): void => appendFileSync(join(data, 'collect.log'), `${new Date().toISOString()} ${line}\n`);
+  if (!res.ok) {
+    log(`HTTP ${res.status} (${html.length} bytes, ${/Just a moment/i.test(html) ? 'Cloudflare challenge' : 'no page'}); nothing appended`);
+    throw new Error(`Exophase answered HTTP ${res.status}; raw response kept as raw/${stamp}.html`);
+  }
+  const page = parsePage(html);
+  if (page.trophies.length === 0 || !Number.isFinite(page.players)) {
+    log(`page did not parse (${page.trophies.length} trophies, players ${page.players}); nothing appended`);
+    throw new Error('the page did not parse whole; raw page kept for inspection');
+  }
+  if (page.total !== null && page.total !== page.trophies.length) {
+    log(`page lists ${page.trophies.length} trophies but says ${page.total}; nothing appended`);
+    throw new Error('incomplete page');
+  }
+  // Keep the id order stable: ids follow trophies.json when it exists, new names are appended.
+  const listPath = join(data, 'trophies.json');
+  const known: Array<{ id: number; name: string; description: string; tier: string; points: number; secret: boolean }> =
+    existsSync(listPath) ? JSON.parse(readFileSync(listPath, 'utf8')) : [];
+  for (const t of page.trophies) {
+    if (!known.some((k) => k.name === t.name)) {
+      known.push({ id: known.length + 1, name: t.name, description: t.description, tier: t.tier, points: POINTS[t.tier] ?? 15, secret: t.secret });
     }
-    at = new Date();
-    const stamp = at.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z/, 'Z');
-    writeFileSync(join(DATA_DIR, 'raw', `${stamp}.html`), r.html);
-    if (r.status !== 200) throw new Error(`Exophase answered ${r.status}`);
-    html = r.html;
   }
-  const p = parsePage(html);
-  if (p.total !== null && p.total !== p.trophies.length) console.error(`warning: page says ${p.total} trophies, parsed ${p.trophies.length}`);
-  const read = { slot: slotOf(at), at: at.toISOString(), players_tracked: p.players_tracked, trophies_earned: p.trophies_earned, rates: p.rates };
-  if (append) {
-    appendFileSync(join(DATA_DIR, 'reads.jsonl'), `${JSON.stringify(read)}\n`);
-    writeFileSync(join(DATA_DIR, 'trophies.json'), `${JSON.stringify(p.trophies, null, 1)}\n`);
-  }
-  console.log(`${read.at} players ${p.players_tracked} earned ${p.trophies_earned} trophies ${p.trophies.length}${append ? ' (appended)' : ''}`);
-  for (const [i, t] of p.trophies.entries()) console.log(`${String(t.id).padStart(2)} ${t.tier.padEnd(8)} ${p.rates[i].toFixed(2).padStart(6)}%  ${t.name}`);
+  writeFileSync(listPath, `${JSON.stringify(known, null, 1)}\n`);
+  const rates = known.map((k) => page.trophies.find((t) => t.name === k.name)?.rate ?? null);
+  const read = {
+    slot: slotOf(started),
+    at: new Date(started).toISOString(),
+    players_tracked: page.players,
+    trophies_earned: page.earned,
+    rates,
+  };
+  appendFileSync(join(data, 'reads.jsonl'), `${JSON.stringify(read)}\n`);
+  log(`ok: ${page.trophies.length} trophies, ${page.players} players tracked`);
+  console.log(`appended a read: ${page.players} players tracked, ${page.trophies.length} trophies -> ${data}`);
 }
 
-main().catch((e) => { console.error(String(e?.stack ?? e)); process.exit(1); });
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});

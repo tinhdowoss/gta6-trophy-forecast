@@ -1,22 +1,30 @@
-// A synthetic launch week of Exophase's GTA VI page, for backtesting while the real page cannot be read.
+// A synthetic GTA VI launch week on Exophase, for backtesting only (simulator assumptions, not data).
 //
-//   node tools/simulate.ts --trophies <case.in or trophies.json> --seed 1 [--out <dir>]
+//   node tools/simulate.ts --seed 1 [--out <dir>]      (default <forecast-data>/sim/s<seed>)
 //
-// Writes <out>/reads.jsonl (one read every 10 minutes in the case-history shape) and <out>/trophies.json, by default to
-// forecast-data/synthetic/s<seed>/ beside the repository. These are the simulator's assumptions, not data:
-//   - players buy the game over the week (most on day one) and play a lognormal number of hours a day;
-//   - Exophase starts tracking a player some lognormal delay after they start, so the tracked base keeps adding
-//     players who have played little (dilution);
-//   - each trophy needs a number of play hours (story chapters in order, side content scattered, completionist content
-//     late and optional), scaled per player; platinum needs every other trophy;
-//   - Exophase refreshes on a cadence drawn per seed (1 to 12 hours, jittered); the page prints rates to 2 decimals.
+// Players start the game after launch, become tracked by Exophase some hours later, play at their own intensity
+// until they drop off, and earn a trophy once their hours reach that trophy's threshold (story trophies in chapter
+// order, side activities only for interested players, collectibles and 100% completion late and rarely). The page
+// starts as the launch-night page the house saw (638 players, pre-release accounts), Exophase refreshes on its own
+// random cadence (sometimes serving a stale page again), and the house reads every 30 minutes, then every 10 minutes.
+// Writes reads.jsonl and trophies.json in the shape tools/collect.ts writes them.
+
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-interface Trophy { id: number; name: string; description: string; tier: string; points: number; secret: boolean }
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const KIT_INPUT = process.env.KIT_INPUT ?? join(REPO, '..', 'kit-forecast', 'gta6-trophy-rarity-forecast-01-kit', 'input');
+const DATA = process.env.FORECAST_DATA ?? join(REPO, '..', 'forecast-data');
+const LAUNCH_MS = Date.parse('2026-11-19T00:00:00Z');
 
-function mulberry32(seed: number): () => number {
+function argValue(name: string, fallback: string): string {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+}
+
+/** mulberry32: a small seeded generator, so a seed always gives the same week. */
+function makeRandom(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -27,103 +35,146 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-const args = process.argv.slice(2);
-const arg = (name: string, dflt: string): string => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : dflt; };
-const seed = Number(arg('--seed', '1'));
-const rnd = mulberry32(seed * 7919 + 13);
-const normal = (): number => { const u = Math.max(1e-12, rnd()), v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
-const lognormal = (median: number, sd: number): number => median * Math.exp(sd * normal());
-const uniform = (a: number, b: number): number => a + (b - a) * rnd();
+interface Trophy {
+  id: number;
+  name: string;
+  description: string;
+  tier: string;
+  points: number;
+  secret: boolean;
+}
 
-const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url));
-const src = JSON.parse(readFileSync(arg('--trophies', here('../../kit-forecast/gta6-trophy-rarity-forecast-01-kit/input/p00.in')), 'utf8'));
-const trophies: Trophy[] = Array.isArray(src) ? src : src.trophies;
-const prelaunch: Array<number | null> | null = Array.isArray(src) ? null : src.history?.[0]?.rates ?? null;
-const outDir = arg('--out', join(process.env.FORECAST_DATA ?? here('../../forecast-data'), 'synthetic', `s${seed}`));
-
-// ---- trophy archetypes: (play hours needed, chance a player ever goes for it) ----
-interface Need { hours: number; prob: number; spread: number }
-const chapterHours = [6, 14, 24, 34].map((h) => h * uniform(0.8, 1.25));
-const finalHours = chapterHours[3] * uniform(1.25, 1.5);
-const needs: Need[] = trophies.map((t) => {
+/** Hours of play a trophy needs (median) and the share of players who go for it at all. */
+function trophyDesign(t: Trophy, rnd: () => number, normal: () => number): { hours: number; interest: number; jitter: number } {
   const d = t.description;
-  const ch = /Complete Chapter (\d+)/.exec(d);
-  if (t.tier === 'platinum') return { hours: 0, prob: 0, spread: 0 };
-  if (ch) return { hours: chapterHours[Math.min(3, Number(ch[1]) - 1)], prob: 0.97, spread: 0.25 };
-  if (/final mission\.$/.test(d) && !/for /.test(d)) return { hours: finalHours, prob: 0.95, spread: 0.25 };
-  if (/100% Completion/.test(d)) return { hours: uniform(90, 160), prob: uniform(0.03, 0.12), spread: 0.3 };
-  if (/final mission for/.test(d)) return { hours: uniform(15, 45), prob: uniform(0.4, 0.8), spread: 0.4 };
-  if (/Gone Fishing/.test(d)) return { hours: 0.4, prob: 0.995, spread: 0.3 };
-  if (t.secret && /^Complete /.test(d)) return { hours: uniform(3, finalHours * 0.95), prob: 0.95, spread: 0.3 };
-  if (t.secret) return { hours: uniform(1, 30), prob: uniform(0.55, 0.97), spread: 0.4 };
-  if (/\b(all|every|100|250|50|20|3 Collectible|10 vehicles)\b/.test(d)) return { hours: uniform(25, 110), prob: uniform(0.05, 0.4), spread: 0.5 };
-  return { hours: uniform(1, 25), prob: uniform(0.2, 0.8), spread: 0.6 };
-});
-const platIdx = trophies.findIndex((t) => t.tier === 'platinum');
-
-// ---- players ----
-// --pace scales how fast players play (below 1: a calmer week whose rates move less); --late scales how late players
-// buy and get tracked (above 1: more dilution by newcomers through the week).
-const pace = Number(arg('--pace', '1'));
-const late = Number(arg('--late', '1'));
-const N = Math.round(uniform(40_000, 120_000));
-const buyMeanH = uniform(10, 30) * late;
-const trackDelayMedH = uniform(12, 48) * late;
-const interestMedH = uniform(15, 35); // total hours a player will put in this week, median
-const hoursPerDayMed = uniform(2, 4) * pace;
-const nT = trophies.length;
-// visible[i] = sorted clock hours at which each player's trophy i became visible to Exophase
-const visible: number[][] = trophies.map(() => []);
-const tracked: number[] = [];
-for (let j = 0; j < N; j++) {
-  const start = rnd() < 0.55 ? -Math.log(Math.max(1e-9, rnd())) * buyMeanH * 0.4 : -Math.log(Math.max(1e-9, rnd())) * buyMeanH * 3;
-  const track = start + lognormal(trackDelayMedH, 1.3);
-  const speed = lognormal(hoursPerDayMed, 0.55) / 24; // play hours per clock hour
-  const skill = lognormal(1, 0.3);
-  const completionist = lognormal(1, 0.6);
-  const interest = lognormal(interestMedH, 0.9); // play hours after which the player stops
-  tracked.push(track);
-  let lastEarn = 0, all = true;
-  for (let i = 0; i < nT; i++) {
-    if (i === platIdx) continue;
-    const n = needs[i];
-    if (rnd() > Math.min(1, n.prob * (n.prob < 0.5 ? completionist : 1))) { all = false; continue; }
-    const playH = n.hours * skill * Math.exp(n.spread * normal());
-    if (playH > interest) { all = false; continue; }
-    const earnAt = start + playH / speed;
-    visible[i].push(Math.max(earnAt, track));
-    lastEarn = Math.max(lastEarn, earnAt);
+  const vary = (x: number, s = 0.25): number => x * Math.exp(s * normal());
+  const chapter = /Chapter (\d)/.exec(d);
+  if (t.tier === 'platinum') return { hours: Infinity, interest: 1, jitter: 0 };
+  if (/Gone Fishing/.test(d)) return { hours: vary(0.4), interest: 1, jitter: 0.3 };
+  if (chapter) return { hours: vary([0, 5, 12, 21, 31][Number(chapter[1])] ?? 30), interest: 1, jitter: 0.25 };
+  if (/final mission\.$/.test(d)) return { hours: vary(42), interest: 1, jitter: 0.25 };
+  if (/100% Completion/.test(d)) return { hours: vary(140, 0.3), interest: 0.06, jitter: 0.2 };
+  if (/Breakfast Run|Cartel Heist|Child's Play|Headliners|VCIA Takedown|Savage Glory/.test(d)) {
+    return { hours: vary(4 + 34 * rnd()), interest: 1, jitter: 0.25 };
   }
-  if (platIdx >= 0 && all) visible[platIdx].push(Math.max(lastEarn + 0.1, track));
+  if (/final mission for/.test(d)) return { hours: vary(18 + 30 * rnd()), interest: 0.4 + 0.4 * rnd(), jitter: 0.35 };
+  if (/250 Stunts|100 locations|every spot|Collectible Card|every location|all Shooting|Explore all|all garage|50 Challenges|8 mission strands/.test(d)) {
+    return { hours: vary(35 + 70 * rnd(), 0.3), interest: 0.08 + 0.3 * rnd(), jitter: 0.4 };
+  }
+  if (t.secret) return { hours: vary(1 + 30 * rnd()), interest: 0.85 + 0.15 * rnd(), jitter: 0.4 };
+  return { hours: vary(2 + 20 * rnd(), 0.4), interest: 0.2 + 0.7 * rnd(), jitter: 0.6 };
 }
-for (const v of visible) v.sort((a, b) => a - b);
-tracked.sort((a, b) => a - b);
-const countLE = (arr: number[], t: number): number => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] <= t) lo = m + 1; else hi = m; } return lo; };
 
-// ---- refresh schedule and reads ----
-const LAUNCH = Date.parse('2026-11-19T00:00:00Z');
-const cadence = [1, 2, 3, 6, 8, 12][Math.floor(rnd() * 6)];
-const refreshes: number[] = [];
-for (let t = uniform(3.5, 4.5); t < 24 * 8; t += cadence * uniform(0.75, 1.25)) refreshes.push(t);
-interface PageState { players: number; earned: number; rates: Array<number | null> }
-const stateAt = (t: number): PageState => {
-  const P = Math.max(1, countLE(tracked, t));
-  let earned = 0;
-  const rates = visible.map((v) => { const e = countLE(v, t); earned += e; return Math.round((e / P) * 10000) / 100; });
-  return { players: P, earned, rates };
-};
-const pre: PageState = prelaunch ? { players: 638, earned: 943, rates: prelaunch } : stateAt(0);
-mkdirSync(outDir, { recursive: true });
-const lines: string[] = [];
-let ri = -1;
-let cur: PageState = pre;
-for (let ms = Date.parse('2026-11-18T23:50:00Z'); ms <= LAUNCH + 24 * 8 * 3_600_000; ms += 600_000) {
-  const h = (ms - LAUNCH) / 3_600_000;
-  while (ri + 1 < refreshes.length && refreshes[ri + 1] <= h) { ri++; cur = stateAt(refreshes[ri]); }
-  const at = new Date(ms + 300).toISOString();
-  lines.push(JSON.stringify({ slot: new Date(ms).toISOString().replace('.000Z', 'Z'), at, players_tracked: cur.players, trophies_earned: cur.earned, rates: cur.rates }));
+function main(): void {
+  const seed = Number(argValue('seed', '1'));
+  const out = resolve(argValue('out', join(DATA, 'sim', `s${seed}`)));
+  const rnd = makeRandom(seed * 7919 + 13);
+  const normal = (): number => {
+    const u = Math.max(1e-12, rnd());
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rnd());
+  };
+  const practice = JSON.parse(readFileSync(join(KIT_INPUT, 'p00.in'), 'utf8')) as { trophies: Trophy[]; history: Array<{ rates: number[]; players_tracked: number }> };
+  const trophies = practice.trophies;
+  const launchPage = practice.history[0];
+  const nT = trophies.length;
+
+  // The week's regime: how many players, how fast they arrive and sync, how hard they play, how often Exophase refreshes.
+  const nPlayers = Math.round(Math.exp(Math.log(15_000) + rnd() * Math.log(8))); // 15k .. 120k tracked by the end
+  const earlyShare = 0.35 + 0.4 * rnd();
+  const lateMean = 40 + 200 * rnd();
+  const syncMean = 1 + 20 * rnd() ** 2;
+  const intensityMedian = 0.08 + 0.1 * rnd(); // hours played per hour (2 to 4.3 h a day)
+  const capMedian = 15 + 45 * rnd(); // hours played before a player drops the game
+  const refreshGap = 0.3 + 3 * rnd() ** 1.5; // median hours between Exophase refreshes
+  const staleChance = 0.05 * rnd();
+  const design = trophies.map((t) => trophyDesign(t, rnd, normal));
+  const plat = trophies.findIndex((t) => t.tier === 'platinum');
+
+  // Effective time from which each player's trophy counts on the page: max(tracked, earned).
+  const counted: Float64Array[] = design.map(() => new Float64Array(nPlayers));
+  const tracked = new Float64Array(nPlayers);
+  for (let p = 0; p < nPlayers; p++) {
+    const start = rnd() < earlyShare ? -Math.log(1 - rnd()) * 6 : -Math.log(1 - rnd()) * lateMean;
+    const track = start + -Math.log(1 - rnd()) * syncMean;
+    tracked[p] = track;
+    const intensity = Math.min(0.7, intensityMedian * Math.exp(0.7 * normal()));
+    const cap = capMedian * Math.exp(1.0 * normal());
+    let platTime = 0;
+    for (let j = 0; j < nT; j++) {
+      if (j === plat) continue;
+      const d = design[j];
+      let earn = Infinity;
+      if (rnd() < d.interest) {
+        const need = d.hours * Math.exp(d.jitter * normal());
+        if (need <= cap) earn = start + need / intensity;
+      }
+      counted[j][p] = Math.max(track, earn);
+      platTime = Math.max(platTime, earn);
+    }
+    if (plat >= 0) counted[plat][p] = Math.max(track, platTime);
+  }
+  for (const arr of counted) arr.sort();
+  tracked.sort();
+  const countBefore = (arr: Float64Array, h: number): number => {
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] <= h) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  // Launch-night accounts: the 638 players the page showed before launch, with the trophies they held.
+  const launchEarners = launchPage.rates.map((r) => Math.round((r / 100) * launchPage.players_tracked));
+  const pageAt = (h: number): { players: number; rates: number[]; earned: number } => {
+    const players = launchPage.players_tracked + countBefore(tracked, h);
+    const earners = counted.map((arr, j) => launchEarners[j] + countBefore(arr, h));
+    return {
+      players,
+      rates: earners.map((e) => Math.round((10_000 * Math.min(e, players)) / players) / 100),
+      earned: earners.reduce((s, e) => s + e, 0),
+    };
+  };
+
+  // Exophase refreshes: the launch page until about 04:20, then a random cadence.
+  const refreshTimes: number[] = [4.2 + 0.3 * rnd()];
+  while (refreshTimes[refreshTimes.length - 1] < 175) {
+    refreshTimes.push(refreshTimes[refreshTimes.length - 1] + refreshGap * Math.exp(0.6 * normal()) + 0.05);
+  }
+  const pages = refreshTimes.map((h) => pageAt(h));
+  const launchState = { players: launchPage.players_tracked, rates: launchPage.rates, earned: launchEarners.reduce((s, e) => s + e, 0) };
+  const lines: string[] = [];
+  const startMs = Date.parse('2026-11-18T23:50:00Z');
+  const endMs = Date.parse('2026-11-26T01:10:00Z');
+  const switchMs = Date.parse('2026-11-19T11:30:00Z');
+  let previous = launchState;
+  for (let ms = startMs; ms <= endMs; ms += ms < switchMs ? 1_800_000 : 600_000) {
+    if (rnd() < 0.02) continue; // a failed read
+    const h = (ms - LAUNCH_MS) / 3.6e6 + 1 / 3600;
+    let k = -1;
+    while (k + 1 < refreshTimes.length && refreshTimes[k + 1] <= h) k++;
+    let page = k < 0 ? launchState : pages[k];
+    if (k >= 1 && rnd() < staleChance) page = pages[k - 1];
+    else previous = page;
+    void previous;
+    lines.push(
+      JSON.stringify({
+        slot: new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z'),
+        at: new Date(ms + 300 + Math.floor(rnd() * 200)).toISOString(),
+        players_tracked: page.players,
+        trophies_earned: page.earned,
+        rates: page.rates,
+      }),
+    );
+  }
+  mkdirSync(out, { recursive: true });
+  writeFileSync(join(out, 'reads.jsonl'), `${lines.join('\n')}\n`);
+  writeFileSync(join(out, 'trophies.json'), `${JSON.stringify(trophies, null, 1)}\n`);
+  const end = pageAt(144);
+  console.log(
+    `s${seed}: ${nPlayers} players, gap ${refreshGap.toFixed(2)} h, sync ${syncMean.toFixed(1)} h, ${lines.length} reads; at the target ${end.players} tracked, ch1 ${end.rates[2]}% final ${end.rates[6]}% plat ${end.rates[plat]}%`,
+  );
 }
-writeFileSync(join(outDir, 'reads.jsonl'), `${lines.join('\n')}\n`);
-writeFileSync(join(outDir, 'trophies.json'), `${JSON.stringify(trophies, null, 1)}\n`);
-const fin = stateAt(24 * 7);
-console.log(`seed ${seed}: N ${N}, cadence ${cadence}h, refreshes ${refreshes.length}, day-7 players ${fin.players}, ch1 ${fin.rates[2]}%, final ${fin.rates[6]}%, plat ${fin.rates[platIdx]}%`);
+
+main();
