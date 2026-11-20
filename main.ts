@@ -438,21 +438,27 @@ function enforceStoryOrder(q: number[][], trophies: Trophy[]): void {
 function calibrateQuantiles(refs: Refresh[], earners: number[][], horizon: number, n: number) {
   const lastIdx = refs.length - 1;
   const xLast = logTime(refs[lastIdx].h);
-  const cuts: number[] = [];
-  for (let k = 0; k < lastIdx; k++) {
-    if (refs[k].h < PARAMS.minTrendHours) continue;
-    const dp = xLast - logTime(refs[k].h);
-    if (dp >= PARAMS.cutMin * horizon && dp <= PARAMS.cutMax * horizon && dp > 0.05) cuts.push(k);
-  }
-  // At most 10 cuts, spread evenly, so the run time stays flat.
-  const chosen = cuts.length <= 10 ? cuts : Array.from({ length: 10 }, (_, j) => cuts[Math.round((j * (cuts.length - 1)) / 9)]);
-  const actual = refs[lastIdx].rates.map((r) => (r === null || r === undefined ? NaN : logit(r)));
-  const preds: Array<{ scale: number; f: Record<ModelName, number[]> }> = [];
-  for (const k of chosen) {
-    const sub = refs.slice(0, k + 1).filter((r) => r.h >= PARAMS.minTrendHours);
-    if (sub.length < PARAMS.minRefreshesForTrend) continue;
-    const dp = xLast - logTime(refs[k].h);
-    preds.push({ scale: Math.pow(horizon / dp, PARAMS.spreadExp), f: modelForecasts(refs, earners, k, dp, n) });
+  const first = refs.findIndex((r) => r.h >= PARAMS.minTrendHours);
+  const preds: Array<{ scale: number; f: Record<ModelName, number[]>; actual: number[]; end: number }> = [];
+  // Several distinct answering refreshes keep a single unusual refresh
+  // from providing every residual used to pick models and size the band.
+  for (const fraction of [0.45, 0.65, 0.82, 1]) {
+    const desired = xLast - (1 - fraction) * Math.min(horizon, 1);
+    let end = lastIdx;
+    while (end > first && logTime(refs[end].h) > desired) end--;
+    if (preds.some((p) => p.end === end)) continue;
+    const endTime = logTime(refs[end].h);
+    const actual = refs[end].rates.map((r) => (r == null ? NaN : logit(r)));
+    const cuts: number[] = [];
+    for (let k = first + PARAMS.minRefreshesForTrend - 1; k < end; k++) {
+      const dp = endTime - logTime(refs[k].h);
+      if (dp >= Math.max(0.05, PARAMS.cutMin * horizon) && dp <= PARAMS.cutMax * horizon) cuts.push(k);
+    }
+    const chosen = cuts.length <= 3 ? cuts : [cuts[0], cuts[Math.floor(cuts.length / 2)], cuts[cuts.length - 1]];
+    for (const k of chosen) {
+      const dp = endTime - logTime(refs[k].h);
+      preds.push({ scale: Math.pow(horizon / dp, PARAMS.spreadExp), f: modelForecasts(refs, earners, k, dp, n), actual, end });
+    }
   }
   const prior: Record<ModelName, number> = { persist: PARAMS.priorPersist, logit: PARAMS.priorLogit, counts: PARAMS.priorCounts, decay: PARAMS.priorDecay, analog: PARAMS.priorAnalog };
   const weights = { ...prior };
@@ -461,13 +467,14 @@ function calibrateQuantiles(refs: Refresh[], earners: number[][], horizon: numbe
     for (const m of MODELS) {
       let s = 0, c = 0;
       for (const p of preds) for (let i = 0; i < n; i++) {
-        const e = actual[i] - p.f[m][i];
+        const e = p.actual[i] - p.f[m][i];
         if (Number.isFinite(e)) { s += Math.abs(e) * p.scale; c++; }
       }
       loss[m] = c ? s / c : Infinity;
     }
     const best = Math.min(...MODELS.map((m) => loss[m]));
-    const reliability = preds.length / (preds.length + 2);
+    const endpoints = new Set(preds.map((p) => p.end)).size;
+    const reliability = endpoints / (endpoints + 1);
     for (const m of MODELS) {
       const w = Number.isFinite(loss[m]) ? Math.exp(-(loss[m] - best) / PARAMS.weightTemp) : 0;
       weights[m] = (1 - reliability) * prior[m] + reliability * prior[m] * w;
@@ -479,13 +486,48 @@ function calibrateQuantiles(refs: Refresh[], earners: number[][], horizon: numbe
   const pooled: number[] = [];
   const own: number[][] = Array.from({ length: n }, () => []);
   for (const p of preds) for (let i = 0; i < n; i++) {
-    const e = (actual[i] - blend(p.f, i)) * p.scale;
+    const e = (p.actual[i] - blend(p.f, i)) * p.scale;
     if (Number.isFinite(e)) { pooled.push(e); own[i].push(e); }
   }
   return { weights, blend, pooled: pooled.sort((a, b) => a - b), own };
 }
 
 /** Quantile rows (percent) for one case. */
+function coldStartForecast(c: Case, last: Refresh, baseline: Row[]): Row[] {
+  const age = Math.max(0, hoursOf(c.at) - last.h);
+  const hours = Math.max(0, c.horizon_minutes / 60);
+  // Mix a page that stays cached with refreshes of varying size. Entrants
+  // added by a refresh have had less time to earn the optional trophies.
+  const arrivalRate = Math.max(0.15, Math.min(1.25, (age + hours) / 5));
+  const scenarios = [
+    { growth: 1, progress: 0, probability: 0.20 },
+    { growth: 1 + 1.5 * arrivalRate, progress: 0.18, probability: 0.15 },
+    { growth: 1 + 3 * arrivalRate, progress: 0.10, probability: 0.30 },
+    { growth: 1 + 5 * arrivalRate, progress: 0.05, probability: 0.25 },
+    { growth: 1 + 8 * arrivalRate, progress: 0.02, probability: 0.10 },
+  ];
+  return c.trophies.map((trophy, index) => {
+    const rate = last.rates[index];
+    if (rate == null) return baseline[index];
+    const samples = scenarios.map(({ growth, progress, probability }) => {
+      const p = rate / 100;
+      const incumbentEarners = Math.round(p * last.players);
+      const newcomerRate = p * (progress + (1 - progress) * p ** 2);
+      const newPlayers = (growth - 1) * last.players;
+      const rateAfterRefresh = 100 * (incumbentEarners + newPlayers * newcomerRate) / (last.players + newPlayers);
+      return { value: growth === 1 ? rate : rateAfterRefresh, probability };
+    }).sort((a, b) => a.value - b.value);
+    return { id: trophy.id, q: LEVELS.map((level) => {
+      let cumulative = 0;
+      for (const sample of samples) {
+        cumulative += sample.probability;
+        if (cumulative >= level - 1e-9) return sample.value;
+      }
+      return samples[samples.length - 1].value;
+    }) };
+  });
+}
+
 function forecastCase(c: Case): Row[] {
   const n = c.trophies.length;
   const refs = dedupeRefreshes(c.history);
@@ -497,6 +539,10 @@ function forecastCase(c: Case): Row[] {
   const hEff = effectiveTargetHours(refs, hTarget, PARAMS.minTrendHours);
   const horizon = Math.max(0, logTime(hEff) - logTime(last.h));
   const baseRows = persistenceRows(c);
+
+  if (refs.length === 1 && last.h <= 0 && hTarget > last.h && c.horizon_minutes <= 360) {
+    return coldStartForecast(c, last, baseRows);
+  }
 
   if (trendRefs < PARAMS.minRefreshesForTrend || horizon <= 0) {
     // Too little history to see a trend: persistence, with the spread at least the prior's.

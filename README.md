@@ -39,9 +39,10 @@ one unit, about as far as day 0.9 → day 2.5, which the history itself contains
      8 best matches are averaged, and a level offset a costs extra. Rare trophies get the lag-then-accelerate shape
      from the trophies ahead of them, with no parametric curve.
 5. **Weights and quantiles** (`calibrateQuantiles`). The history is cut at earlier refreshes, between 0.25× and 1.6× the
-   real log-time horizon before its last refresh. Every model forecasts that last refresh from each cut. A model's
+   real log-time horizon before each of up to four distinct answering refreshes. Every model forecasts each answer
+   using only data through its corresponding cut. A model's
    weight is its prior × exp(−loss / 0.12), its loss being the mean absolute error with the residuals scaled to the
-   real horizon by (ratio)^0.75, with the prior kept in proportion to how few cuts there are. The blended median's
+   real horizon by (ratio)^0.75, with the prior kept in proportion to how few answering refreshes there are. The blended median's
    residuals give the quantile offsets, which are empirical and asymmetric, blended with a normal prior (0.45 logit per
    log-time unit) by the number of residuals. Each trophy's width mixes its own residual scale with the pooled one,
    +30% per logit unit below 1.8% (rare trophies surprise most), +10% on the 5/95% tails, and a floor for the page's
@@ -49,8 +50,10 @@ one unit, about as far as day 0.9 → day 2.5, which the history itself contains
 6. **Story order** (`enforceStoryOrder`). Chapter 1 ≥ … ≥ Chapter 4 ≥ the final mission ≥ 100% completion
    (isotonic regression on logits, level by level, which keeps rows ordered), and the platinum at or below every
    trophy. The opening trophy, at 100% in every refresh, stays at 100%.
-7. **Short history and errors.** With fewer than 3 post-launch refreshes (the practice cases), the forecast is
-   persistence with a spread of at least the prior's. Any error in a case writes the house persistence row for it
+7. **Short history and errors.** For one pre-launch page state over a short horizon, `coldStartForecast` uses
+   a mixture of cached and refreshed page scenarios. Each refresh adds players and estimates how many of the
+   newcomers have already earned each trophy. The scenario weights and growth ranges are modeling assumptions.
+   Other sparse histories use persistence with a wider band. A model failure writes the house persistence row
    (`writeForecast`: rounded, clamped to 0..100, non-decreasing, at most about 3 KB).
 
 Node 22 standard library only, no network, no randomness: two runs write the same bytes. About 40 ms a case.
@@ -111,7 +114,22 @@ These numbers come from a simulator, not from Exophase data. The house AI foreca
 is kept a little wider than the backtest's optimum (spreadScale 0.75 against ~0.6), because real weeks will surprise
 the model more than simulated ones.
 
-Built by an AI agent (Claude Code) for the make.fun bounty
+### Revision comparison
+
+The table compares the previous submission with the rolling calibration revision on 24 newly seeded synthetic
+worlds. The long cut uses the final forecast horizon. The simulator recorded zero usable Exophase cases locally.
+
+| Cut | Previous loss | Current loss | Persistence loss | Curve loss | Current 90% coverage |
+|---|---:|---:|---:|---:|---:|
+| Early | 1.410898 | 1.392996 | 2.307170 | 2.259760 | 63.0% |
+| Final-length | 0.536910 | 0.537887 | 1.309201 | 1.149565 | 90.3% |
+
+```sh
+node tools/make-case.ts --worlds 24 --seed 64191 --kit "$KIT" --out /tmp/gta6-v2-cases
+node tools/backtest.ts --cases /tmp/gta6-v2-cases --quiet
+```
+
+Built by AI coding agents (Claude Code and Codex) for the make.fun bounty
 [gta6-trophy-rarity-forecast-01](https://make.fun/bounty/gta6-trophy-rarity-forecast-01).
 
 License: MIT (see `LICENSE`).
