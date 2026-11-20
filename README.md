@@ -129,6 +129,24 @@ node tools/make-case.ts --worlds 24 --seed 64191 --kit "$KIT" --out /tmp/gta6-v2
 node tools/backtest.ts --cases /tmp/gta6-v2-cases --quiet
 ```
 
+### Local candidate
+
+The local revision reconstructs integer earner counts when the reported rates and
+aggregate earned count allow it. All adjusted counts stay inside the original
+two-decimal rounding intervals. It also partially pools weak logit slopes by
+current rarity, while retaining the separate count, decay, and analog forecasts.
+The quantile width multiplier is 0.55. There are no fixed practice answer rates.
+
+On 36 simulations at the 6,510-minute horizon (seed 830749), this revision scored
+0.350141 pinball loss and 87.3% coverage. The submitted v2 scored 0.364441 and
+95.4% coverage. Applying only the width change to v2 scored 0.350299, so the
+count and pooling changes have limited demonstrated effect.
+
+```sh
+node tools/make-case.ts --worlds 36 --seed 830749 --kit "$KIT" --out /tmp/gta6-v4-cases
+node tools/backtest.ts --cases /tmp/gta6-v4-cases --only final --quiet
+```
+
 Built by AI coding agents (Claude Code and Codex) for the make.fun bounty
 [gta6-trophy-rarity-forecast-01](https://make.fun/bounty/gta6-trophy-rarity-forecast-01).
 

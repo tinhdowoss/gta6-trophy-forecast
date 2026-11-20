@@ -25,9 +25,9 @@ const Z = [-1.6448536, -0.6744898, 0, 0.6744898, 1.6448536];
 const LAUNCH_MS = Date.parse('2026-11-19T00:00:00Z');
 
 interface Trophy { id: number; name?: string; description?: string; tier?: string }
-interface Read { at: string; slot?: string; players_tracked: number; rates: Array<number | null> }
+interface Read { at: string; slot?: string; players_tracked: number; trophies_earned?: number; rates: Array<number | null> }
 interface Case { id?: string; at: string; target: string; horizon_minutes: number; levels: number[]; trophies: Trophy[]; history: Read[] }
-interface Refresh { h: number; seenH: number; players: number; rates: Array<number | null> }
+interface Refresh { h: number; seenH: number; players: number; total?: number; rates: Array<number | null>; observedRates: Array<number | null> }
 interface Row { id: number; q: number[] }
 
 /** Tunable numbers. FORECAST_PARAMS (JSON) overrides them for the backtest only; the grader never sets it. */
@@ -61,7 +61,8 @@ const PARAMS = {
   rareBoost: 0.3,         // extra spread per logit unit below -4 (rare trophies surprise most)
   tailBoost: 1.1,         // widen the 5% / 95% quantiles a little (fat tails)
   biasShrink: 0,          // share of the pseudo-forecast median bias corrected (it does not carry over: none)
-  spreadScale: 0.75,      // overall width of the band (the backtest's best is ~0.6; kept wider for real surprises)
+  spreadScale: 0.55,      // overall width of the forecast band
+  pooledTrendShare: 0.15, // maximum share of the neighboring rarity group's trend
   minRefreshesForTrend: 3,
   cutMin: 0.25,           // pseudo-forecast horizons, as shares of the real one
   cutMax: 1.6,
@@ -121,13 +122,13 @@ function dedupeRefreshes(history: Read[]): Refresh[] {
   for (const r of history) {
     const h = hoursOf(r?.at);
     if (!Number.isFinite(h) || typeof r.players_tracked !== 'number' || !(r.players_tracked > 0) || !Array.isArray(r.rates)) continue;
-    const key = `${r.players_tracked}|${r.rates.join(',')}`;
+    const key = `${r.players_tracked}|${r.trophies_earned ?? ''}|${r.rates.join(',')}`;
     if (key !== prevKey && !seen.has(key) && r.players_tracked >= maxPlayers) {
       const start = Number.isFinite(prevH) ? (prevH + h) / 2 : h;
       // Junk becomes missing; a missing rate carries forward from the refresh before.
       const before = out[out.length - 1];
       const rates = r.rates.map((v, i) => (typeof v === 'number' && Number.isFinite(v) ? clamp(v, 0, 100) : before?.rates[i] ?? null));
-      out.push({ h: start, seenH: h, players: r.players_tracked, rates });
+      out.push({ h: start, seenH: h, players: r.players_tracked, total: r.trophies_earned, rates, observedRates: r.rates });
       seen.add(key);
       maxPlayers = r.players_tracked;
     }
@@ -139,10 +140,38 @@ function dedupeRefreshes(history: Read[]): Refresh[] {
 
 /** earners[k][i] = rate x players / 100 for refresh k and trophy i (NaN where the read lacked the trophy). */
 function toEarnerCounts(refs: Refresh[], n: number): number[][] {
-  return refs.map((r) => Array.from({ length: n }, (_, i) => {
-    const v = r.rates[i];
-    return v === null || v === undefined || !Number.isFinite(v) ? NaN : (v / 100) * r.players;
-  }));
+  return refs.map((r) => {
+    const estimates = Array.from({ length: n }, (_, i) => {
+      const rate = r.rates[i];
+      return rate == null || !Number.isFinite(rate) ? NaN : rate * r.players / 100;
+    });
+    if (!Number.isSafeInteger(r.total) || !Number.isSafeInteger(r.players)
+        || r.observedRates.length !== n || !r.observedRates.every((rate) => rate != null && Number.isFinite(rate))) return estimates;
+    // Enumerate only the integer counts that print the observed rate.
+    const lower = estimates.map((value) => Math.max(0, Math.ceil(value - r.players / 20000 - 1e-8)));
+    const upper = estimates.map((value) => Math.min(r.players, Math.ceil(value + r.players / 20000 - 1e-8) - 1));
+    if (lower.some((count, i) => count > upper[i])) return estimates;
+    const rounded = estimates.map((value, i) => clamp(Math.round(value), lower[i], upper[i]));
+    const total = (counts: number[]): number => counts.reduce((sum, count) => sum + count, 0);
+    const difference = (r.total as number) - total(rounded);
+    if (Math.abs(difference) > n || (r.total as number) < total(lower) || (r.total as number) > total(upper)) return rounded;
+    if (difference === 0) return rounded;
+    const step = Math.sign(difference);
+    for (let remaining = Math.abs(difference); remaining > 0; remaining--) {
+      let best = -1;
+      let bestCost = Infinity;
+      for (let i = 0; i < n; i++) {
+        const next = rounded[i] + step;
+        const cost = step * (rounded[i] - estimates[i]);
+        if (next < lower[i] || next > upper[i] || cost >= bestCost) continue;
+        best = i;
+        bestCost = cost;
+      }
+      if (best === -1) return estimates;
+      rounded[best] += step;
+    }
+    return rounded;
+  });
 }
 
 /** When the answering page was refreshed: the last refresh at or before the target, from the refreshes' cadence. */
@@ -346,6 +375,15 @@ function modelForecasts(refs: Refresh[], earners: number[][], upto: number, hori
     logitFits.push(xs.length >= 2 ? slopeHalves(xs, ys, xs[xs.length - 1], half) : { late: 0, kappa: NaN, weight: 0 });
   }
   const kL = pooledKappa(logitFits);
+  const groups = new Map<number, number[]>();
+  logitFits.forEach(({ late }, i) => {
+    const rate = last.rates[i];
+    if (rate == null || rate <= 0.01 || rate >= 99.99 || !Number.isFinite(late)) return;
+    const band = Math.floor(logit(rate) / 2);
+    const slopes = groups.get(band) ?? [];
+    slopes.push(late);
+    groups.set(band, slopes);
+  });
   for (let i = 0; i < n; i++) {
     const r = last.rates[i];
     if (r === null || r === undefined || !Number.isFinite(r)) { persist.push(NaN); logitTrend.push(NaN); counts.push(NaN); decay.push(NaN); continue; }
@@ -359,7 +397,12 @@ function modelForecasts(refs: Refresh[], earners: number[][], upto: number, hori
       const ys = pts.map((k) => logit(sub[k].rates[i] as number));
       const xLast = xs[xs.length - 1];
       const ws = xs.map((x) => Math.exp(-(xLast - x) / PARAMS.recency));
-      dl = clamp(weightedSlope(xs, ys, ws) * horizon * PARAMS.dampLogit, -4, 4);
+      const own = weightedSlope(xs, ys, ws);
+      const peers = groups.get(Math.floor(l0 / 2)) ?? [];
+      const share = peers.length >= 3 && r > 0.01 && r < 99.99
+        ? PARAMS.pooledTrendShare * 3 / (3 + pts.length) : 0;
+      const slope = share > 0 ? own + share * (median(peers) - own) : own;
+      dl = clamp(slope * horizon * PARAMS.dampLogit, -4, 4);
     }
     logitTrend.push(l0 + dl);
     // Logit trend whose slope decays (or grows) at the rate the history shows.
